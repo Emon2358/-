@@ -1,4 +1,4 @@
-name: Gigafile XGF Explorer Lite
+name: Gigafile XGF Explorer Repository
 
 on:
   schedule:
@@ -37,14 +37,17 @@ jobs:
               private static readonly string chars = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
               private static readonly Random random = new Random();
               private static readonly string baseUrl = "https://xgf.nu/";
-              private static readonly string resultFile = "found_files.txt";
+              private static readonly string resultFile = "data/found_files.txt";
+              private static readonly string summaryFile = "data/summary.md";
               private static readonly HashSet<string> existingCodes = new HashSet<string>();
-              private const int MAX_ATTEMPTS = 50; // 1回の実行で試行する数を50に制限
-              private const int BATCH_SIZE = 5; // 同時実行数を5に制限
-              private static readonly TimeSpan MAX_RUNTIME = TimeSpan.FromMinutes(2); // 最大実行時間を2分に制限
+              private const int MAX_ATTEMPTS = 50;
+              private const int BATCH_SIZE = 5;
+              private static readonly TimeSpan MAX_RUNTIME = TimeSpan.FromMinutes(2);
 
               static async Task Main()
               {
+                  Directory.CreateDirectory("data"); // データディレクトリの作成
+
                   var startTime = DateTime.UtcNow;
                   LoadExistingCodes();
                   
@@ -69,7 +72,7 @@ jobs:
                       }
                       
                       await Task.WhenAll(batchTasks);
-                      await Task.Delay(1000); // 1秒待機
+                      await Task.Delay(1000);
                   }
 
                   var endTime = DateTime.UtcNow;
@@ -77,6 +80,7 @@ jobs:
                   Console.WriteLine($"Total runtime: {(endTime - startTime).TotalSeconds:F1} seconds");
                   
                   await SaveResults(foundFiles);
+                  await UpdateSummary(foundFiles, startTime, endTime);
                   
                   if (foundFiles.Count > 0)
                   {
@@ -123,7 +127,7 @@ jobs:
                       var result = await CheckUrl(code);
                       if (result.exists)
                       {
-                          var fileInfo = $"{code} | {result.filename} | {result.size:N0} bytes | {DateTime.UtcNow:yyyy-MM-dd HH:mm:ss}";
+                          var fileInfo = $"{code} | {result.filename} | {result.size:N0} bytes | {DateTime.UtcNow:yyyy-MM-dd HH:mm:ss} | https://xgf.nu/{code}";
                           lock (foundFiles)
                           {
                               foundFiles.Add(fileInfo);
@@ -140,7 +144,7 @@ jobs:
               static async Task<(bool exists, string filename, long size)> CheckUrl(string code)
               {
                   using var request = new HttpRequestMessage(HttpMethod.Head, baseUrl + code);
-                  request.Headers.Add("User-Agent", "GitHub-Actions-XGF-Explorer-Lite");
+                  request.Headers.Add("User-Agent", "GitHub-Actions-XGF-Explorer-Repository");
                   
                   using var response = await client.SendAsync(request);
                   
@@ -185,6 +189,41 @@ jobs:
                       Console.WriteLine($"Updated results file. Total entries: {newContent.Count}");
                   }
               }
+
+              static async Task UpdateSummary(List<string> newFiles, DateTime startTime, DateTime endTime)
+              {
+                  var totalFiles = File.Exists(resultFile) ? File.ReadLines(resultFile).Count() : 0;
+                  var summaryContent = new List<string>
+                  {
+                      "# XGF Explorer Summary",
+                      "",
+                      $"Last Updated: {DateTime.UtcNow:yyyy-MM-dd HH:mm:ss UTC}",
+                      "",
+                      "## Statistics",
+                      $"- Total files found: {totalFiles}",
+                      $"- Files found in last run: {newFiles.Count}",
+                      $"- Last run duration: {(endTime - startTime).TotalSeconds:F1} seconds",
+                      "",
+                      "## Recent Findings"
+                  };
+
+                  // 最新の10件を表示
+                  var recentFiles = newFiles
+                      .Union(File.Exists(resultFile) ? File.ReadLines(resultFile) : Enumerable.Empty<string>())
+                      .OrderByDescending(x => DateTime.Parse(x.Split('|')[3].Trim()))
+                      .Take(10);
+
+                  summaryContent.Add("| Code | Filename | Size | Found At | Link |");
+                  summaryContent.Add("|------|----------|------|----------|------|");
+                  
+                  foreach (var file in recentFiles)
+                  {
+                      var parts = file.Split('|').Select(p => p.Trim()).ToArray();
+                      summaryContent.Add($"| {parts[0]} | {parts[1]} | {parts[2]} | {parts[3]} | {parts[4]} |");
+                  }
+
+                  await File.WriteAllLinesAsync(summaryFile, summaryContent);
+              }
           }
           EOL
 
@@ -202,29 +241,11 @@ jobs:
           git config --global user.name 'github-actions[bot]'
           git config --global user.email 'github-actions[bot]@users.noreply.github.com'
           
-          if [ -f found_files.txt ]; then
-            git add found_files.txt
-            git commit -m "Update found files: $(date -u +'%Y-%m-%d %H:%M:%S UTC')" || echo "No changes to commit"
+          if [ -d data ]; then
+            git add data/
+            git commit -m "Update exploration results: $(date -u +'%Y-%m-%d %H:%M:%S UTC')" || echo "No changes to commit"
             git push
           fi
-
-      - name: Create Issue for New Findings
-        if: steps.explore.outputs.found_count > 0
-        uses: actions/github-script@v6
-        with:
-          script: |
-            const foundCount = process.env.FOUND_COUNT;
-            const foundFiles = process.env.FOUND_FILES;
-            
-            await github.rest.issues.create({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              title: `[XGF Explorer] Found ${foundCount} TXT Files - ${new Date().toISOString()}`,
-              body: `New TXT files found:\n\`\`\`\n${foundFiles}\n\`\`\``
-            });
-        env:
-          FOUND_COUNT: ${{ steps.explore.outputs.found_count }}
-          FOUND_FILES: ${{ steps.explore.outputs.found_files }}
 
 permissions:
   contents: write
