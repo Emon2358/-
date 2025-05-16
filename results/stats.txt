@@ -1,0 +1,8 @@
+Statistics as of 2025-05-16 04:24:25 UTC
+--------------------------------------------------
+Total requests made: 67,545
+Found links: 0
+Success rate: 0.0000%
+Running time: 300.72 seconds
+Requests per second: 224.61
+Workers: 50
