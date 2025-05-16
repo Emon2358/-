@@ -2,7 +2,7 @@ name: Gigafile XGF Explorer Repository
 
 on:
   schedule:
-    - cron: '*/3 * * * *'  # 3分ごとに実行
+    - cron: '*/2 * * * *'  # 2分ごとに実行
   workflow_dispatch:  # 手動実行用
 
 jobs:
@@ -30,23 +30,33 @@ jobs:
           using System.Collections.Generic;
           using System.IO;
           using System.Linq;
+          using System.Net;
 
           class Program
           {
-              private static readonly HttpClient client = new HttpClient();
+              private static readonly HttpClient client = new HttpClient(new HttpClientHandler
+              {
+                  AutomaticDecompression = DecompressionMethods.GZip | DecompressionMethods.Deflate
+              });
               private static readonly string chars = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
               private static readonly Random random = new Random();
               private static readonly string baseUrl = "https://xgf.nu/";
               private static readonly string resultFile = "data/found_files.txt";
               private static readonly string summaryFile = "data/summary.md";
               private static readonly HashSet<string> existingCodes = new HashSet<string>();
-              private const int MAX_ATTEMPTS = 50;
-              private const int BATCH_SIZE = 5;
-              private static readonly TimeSpan MAX_RUNTIME = TimeSpan.FromMinutes(2);
+              private const int MAX_ATTEMPTS = 100; // 増加
+              private const int BATCH_SIZE = 10; // 並列処理数増加
+              private static readonly TimeSpan MAX_RUNTIME = TimeSpan.FromMinutes(1.5);
 
               static async Task Main()
               {
-                  Directory.CreateDirectory("data"); // データディレクトリの作成
+                  Directory.CreateDirectory("data");
+                  client.DefaultRequestHeaders.Add("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8");
+                  client.DefaultRequestHeaders.Add("Accept-Language", "en-US,en;q=0.5");
+                  client.DefaultRequestHeaders.Add("Accept-Encoding", "gzip, deflate, br");
+                  client.DefaultRequestHeaders.Add("Connection", "keep-alive");
+                  client.DefaultRequestHeaders.Add("Upgrade-Insecure-Requests", "1");
+                  client.Timeout = TimeSpan.FromSeconds(10);
 
                   var startTime = DateTime.UtcNow;
                   LoadExistingCodes();
@@ -72,22 +82,16 @@ jobs:
                       }
                       
                       await Task.WhenAll(batchTasks);
-                      await Task.Delay(1000);
+                      await Task.Delay(500); // 待機時間短縮
                   }
 
                   var endTime = DateTime.UtcNow;
                   Console.WriteLine($"Exploration completed at {endTime:yyyy-MM-dd HH:mm:ss UTC}");
                   Console.WriteLine($"Total runtime: {(endTime - startTime).TotalSeconds:F1} seconds");
+                  Console.WriteLine($"Total requests: {processedCount}");
                   
                   await SaveResults(foundFiles);
-                  await UpdateSummary(foundFiles, startTime, endTime);
-                  
-                  if (foundFiles.Count > 0)
-                  {
-                      var output = string.Join("\n", foundFiles);
-                      Console.WriteLine($"::set-output name=found_files::{output}");
-                      Console.WriteLine($"::set-output name=found_count::{foundFiles.Count}");
-                  }
+                  await UpdateSummary(foundFiles, startTime, endTime, processedCount);
               }
 
               static void LoadExistingCodes()
@@ -96,8 +100,12 @@ jobs:
                   {
                       foreach (var line in File.ReadLines(resultFile))
                       {
-                          var code = line.Split('|')[0].Trim();
-                          existingCodes.Add(code);
+                          var parts = line.Split('|');
+                          if (parts.Length > 0)
+                          {
+                              var code = parts[0].Trim();
+                              existingCodes.Add(code);
+                          }
                       }
                       Console.WriteLine($"Loaded {existingCodes.Count} existing codes");
                   }
@@ -105,7 +113,7 @@ jobs:
 
               static string GenerateUniqueCode()
               {
-                  for (int i = 0; i < 10; i++)
+                  for (int i = 0; i < 20; i++) // 試行回数増加
                   {
                       var code = new string(Enumerable.Range(0, 4)
                           .Select(_ => chars[random.Next(chars.Length)])
@@ -127,7 +135,7 @@ jobs:
                       var result = await CheckUrl(code);
                       if (result.exists)
                       {
-                          var fileInfo = $"{code} | {result.filename} | {result.size:N0} bytes | {DateTime.UtcNow:yyyy-MM-dd HH:mm:ss} | https://xgf.nu/{code}";
+                          var fileInfo = $"{code} | {result.filename} | {result.size:N0} bytes | {DateTime.UtcNow:yyyy-MM-dd HH:mm:ss} | {baseUrl}{code}";
                           lock (foundFiles)
                           {
                               foundFiles.Add(fileInfo);
@@ -137,32 +145,41 @@ jobs:
                   }
                   catch (Exception ex)
                   {
-                      Console.WriteLine($"Error checking {code}: {ex.Message}");
+                      if (ex is HttpRequestException || ex is TaskCanceledException)
+                      {
+                          Console.WriteLine($"Network error checking {code}");
+                      }
+                      else
+                      {
+                          Console.WriteLine($"Error checking {code}: {ex.Message}");
+                      }
                   }
               }
 
               static async Task<(bool exists, string filename, long size)> CheckUrl(string code)
               {
-                  using var request = new HttpRequestMessage(HttpMethod.Head, baseUrl + code);
-                  request.Headers.Add("User-Agent", "GitHub-Actions-XGF-Explorer-Repository");
+                  using var request = new HttpRequestMessage(HttpMethod.Get, baseUrl + code);
+                  request.Headers.Add("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36");
                   
                   using var response = await client.SendAsync(request);
                   
                   if (response.RequestMessage.RequestUri.Host == "gigafile.nu")
                   {
-                      using var fileResponse = await client.SendAsync(new HttpRequestMessage(HttpMethod.Head, response.RequestMessage.RequestUri));
-                      var contentDisposition = fileResponse.Headers.Contains("Content-Disposition") 
-                          ? fileResponse.Headers.GetValues("Content-Disposition").FirstOrDefault() 
-                          : null;
-                      
-                      if (!string.IsNullOrEmpty(contentDisposition))
+                      var responseUri = response.RequestMessage.RequestUri.ToString();
+                      if (responseUri.Contains("/download.php") || responseUri.Contains("/dl_zip.php"))
                       {
-                          var match = Regex.Match(contentDisposition, @"filename[^;=\n]*=((['""]).*?\2|[^;\n]*)");
-                          var filename = match.Success ? match.Groups[1].Value.Trim('"') : "unknown";
-                          var size = fileResponse.Content.Headers.ContentLength ?? 0;
+                          using var fileResponse = await client.SendAsync(new HttpRequestMessage(HttpMethod.Head, responseUri));
+                          var contentDisposition = fileResponse.Headers.Contains("Content-Disposition") 
+                              ? fileResponse.Headers.GetValues("Content-Disposition").FirstOrDefault() 
+                              : null;
                           
-                          if (filename.EndsWith(".txt", StringComparison.OrdinalIgnoreCase))
+                          if (!string.IsNullOrEmpty(contentDisposition))
                           {
+                              var match = Regex.Match(contentDisposition, @"filename[^;=\n]*=((['""]).*?\2|[^;\n]*)");
+                              var filename = match.Success ? match.Groups[1].Value.Trim('"') : "unknown";
+                              var size = fileResponse.Content.Headers.ContentLength ?? 0;
+                              
+                              // .txtファイル以外も記録するように変更
                               return (true, filename, size);
                           }
                       }
@@ -190,7 +207,7 @@ jobs:
                   }
               }
 
-              static async Task UpdateSummary(List<string> newFiles, DateTime startTime, DateTime endTime)
+              static async Task UpdateSummary(List<string> newFiles, DateTime startTime, DateTime endTime, int totalRequests)
               {
                   var totalFiles = File.Exists(resultFile) ? File.ReadLines(resultFile).Count() : 0;
                   var summaryContent = new List<string>
@@ -203,15 +220,16 @@ jobs:
                       $"- Total files found: {totalFiles}",
                       $"- Files found in last run: {newFiles.Count}",
                       $"- Last run duration: {(endTime - startTime).TotalSeconds:F1} seconds",
+                      $"- Requests made: {totalRequests}",
+                      $"- Success rate: {(newFiles.Count * 100.0 / totalRequests):F2}%",
                       "",
                       "## Recent Findings"
                   };
 
-                  // 最新の10件を表示
                   var recentFiles = newFiles
                       .Union(File.Exists(resultFile) ? File.ReadLines(resultFile) : Enumerable.Empty<string>())
                       .OrderByDescending(x => DateTime.Parse(x.Split('|')[3].Trim()))
-                      .Take(10);
+                      .Take(20);
 
                   summaryContent.Add("| Code | Filename | Size | Found At | Link |");
                   summaryContent.Add("|------|----------|------|----------|------|");
@@ -249,4 +267,3 @@ jobs:
 
 permissions:
   contents: write
-  issues: write
