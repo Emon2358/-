@@ -1,0 +1,141 @@
+name: Gigafile XGF Explorer
+
+on:
+  schedule:
+    - cron: '*/30 * * * *'  # Runs every 30 minutes
+  workflow_dispatch:  # Allows manual triggering
+
+jobs:
+  explore:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v3
+        with:
+          dotnet-version: '6.0.x'
+
+      - name: Create XGF Explorer Script
+        run: |
+          cat > XgfExplorer.cs << 'EOL'
+          using System;
+          using System.Net.Http;
+          using System.Threading.Tasks;
+          using System.Text.RegularExpressions;
+          using System.Collections.Generic;
+
+          class Program
+          {
+              private static readonly HttpClient client = new HttpClient();
+              private static readonly string chars = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+              private static readonly Random random = new Random();
+              private static readonly string baseUrl = "https://xgf.nu/";
+
+              static async Task Main()
+              {
+                  var foundFiles = new List<string>();
+                  var attempts = 10; // Number of attempts per run
+                  
+                  for (int i = 0; i < attempts; i++)
+                  {
+                      var code = GenerateCode();
+                      Console.WriteLine($"Checking code: {code}");
+                      
+                      try
+                      {
+                          var result = await CheckUrl(code);
+                          if (result.exists)
+                          {
+                              Console.WriteLine($"[FOUND] Code: {code}, Filename: {result.filename}");
+                              foundFiles.Add($"{code}: {result.filename}");
+                          }
+                          
+                          // Respect rate limit - 2 codes per second
+                          await Task.Delay(500);
+                      }
+                      catch (Exception ex)
+                      {
+                          Console.WriteLine($"Error checking {code}: {ex.Message}");
+                          await Task.Delay(1000);
+                      }
+                  }
+
+                  // Output results as GitHub step output
+                  if (foundFiles.Count > 0)
+                  {
+                      var output = string.Join("\n", foundFiles);
+                      Console.WriteLine($"::set-output name=found_files::{output}");
+                  }
+              }
+
+              static string GenerateCode()
+              {
+                  var code = new char[4];
+                  for (int i = 0; i < 4; i++)
+                  {
+                      code[i] = chars[random.Next(chars.Length)];
+                  }
+                  return new string(code);
+              }
+
+              static async Task<(bool exists, string filename)> CheckUrl(string code)
+              {
+                  var url = baseUrl + code;
+                  using var request = new HttpRequestMessage(HttpMethod.Head, url);
+                  request.Headers.Add("User-Agent", "GitHub-Actions-XGF-Explorer");
+                  
+                  var response = await client.SendAsync(request);
+                  
+                  if (response.RequestMessage.RequestUri.Host == "gigafile.nu")
+                  {
+                      var fileResponse = await client.SendAsync(new HttpRequestMessage(HttpMethod.Head, response.RequestMessage.RequestUri));
+                      var contentDisposition = fileResponse.Headers.Contains("Content-Disposition") 
+                          ? fileResponse.Headers.GetValues("Content-Disposition").FirstOrDefault() 
+                          : null;
+                      
+                      if (!string.IsNullOrEmpty(contentDisposition))
+                      {
+                          var match = Regex.Match(contentDisposition, @"filename[^;=\n]*=((['""]).*?\2|[^;\n]*)");
+                          var filename = match.Success ? match.Groups[1].Value.Trim('"') : "unknown";
+                          return (true, filename);
+                      }
+                  }
+                  
+                  return (false, string.Empty);
+              }
+          }
+          EOL
+
+      - name: Compile and Run Explorer
+        run: |
+          dotnet new console
+          mv XgfExplorer.cs Program.cs
+          dotnet build
+          dotnet run
+
+      - name: Process Results
+        if: always()
+        run: |
+          if [ -n "${{ steps.explore.outputs.found_files }}" ]; then
+            echo "Found files:"
+            echo "${{ steps.explore.outputs.found_files }}"
+          else
+            echo "No files found in this run."
+          fi
+
+      - name: Create Issue for Found Files
+        if: steps.explore.outputs.found_files
+        uses: actions/github-script@v6
+        with:
+          script: |
+            const foundFiles = process.env.FOUND_FILES;
+            if (foundFiles) {
+              await github.rest.issues.create({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                title: `[XGF Explorer] Files Found - ${new Date().toISOString()}`,
+                body: `Found the following files:\n\n${foundFiles}\n\n*This is an automated report from the XGF Explorer GitHub Action.*`
+              });
+            }
+        env:
+          FOUND_FILES: ${{ steps.explore.outputs.found_files }}
