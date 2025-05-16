@@ -1,269 +1,221 @@
-name: Gigafile XGF Explorer Repository
+name: GigaFile Link Finder
 
 on:
-  schedule:
-    - cron: '*/2 * * * *'  # 2分ごとに実行
-  workflow_dispatch:  # 手動実行用
+  workflow_dispatch:  # 手動実行のみ
+    inputs:
+      duration:
+        description: 'Duration to run (minutes)'
+        required: true
+        default: '10'
+        type: choice
+        options:
+          - '5'
+          - '10'
+          - '15'
+          - '20'
+      workers:
+        description: 'Number of workers'
+        required: true
+        default: '25'
+        type: choice
+        options:
+          - '10'
+          - '25'
+          - '50'
 
 jobs:
-  explore:
+  find-links:
     runs-on: ubuntu-latest
     
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 1
 
-      - name: Setup .NET
-        uses: actions/setup-dotnet@v3
+      - name: Set up Python
+        uses: actions/setup-python@v4
         with:
-          dotnet-version: '6.0.x'
+          python-version: '3.11'
 
-      - name: Create XGF Explorer Script
+      - name: Install dependencies
         run: |
-          cat > XgfExplorer.cs << 'EOL'
-          using System;
-          using System.Net.Http;
-          using System.Threading.Tasks;
-          using System.Text.RegularExpressions;
-          using System.Collections.Generic;
-          using System.IO;
-          using System.Linq;
-          using System.Net;
+          python -m pip install --upgrade pip
+          pip install requests
 
-          class Program
-          {
-              private static readonly HttpClient client = new HttpClient(new HttpClientHandler
-              {
-                  AutomaticDecompression = DecompressionMethods.GZip | DecompressionMethods.Deflate
-              });
-              private static readonly string chars = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
-              private static readonly Random random = new Random();
-              private static readonly string baseUrl = "https://xgf.nu/";
-              private static readonly string resultFile = "data/found_files.txt";
-              private static readonly string summaryFile = "data/summary.md";
-              private static readonly HashSet<string> existingCodes = new HashSet<string>();
-              private const int MAX_ATTEMPTS = 100; // 増加
-              private const int BATCH_SIZE = 10; // 並列処理数増加
-              private static readonly TimeSpan MAX_RUNTIME = TimeSpan.FromMinutes(1.5);
+      - name: Create Link Finder Script
+        run: |
+          cat > gigafile_finder.py << 'EOL'
+          import os
+          import random
+          import string
+          import time
+          import requests
+          import re
+          from datetime import datetime, timedelta
+          import concurrent.futures
+          import logging
+          import sys
 
-              static async Task Main()
-              {
-                  Directory.CreateDirectory("data");
-                  client.DefaultRequestHeaders.Add("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8");
-                  client.DefaultRequestHeaders.Add("Accept-Language", "en-US,en;q=0.5");
-                  client.DefaultRequestHeaders.Add("Accept-Encoding", "gzip, deflate, br");
-                  client.DefaultRequestHeaders.Add("Connection", "keep-alive");
-                  client.DefaultRequestHeaders.Add("Upgrade-Insecure-Requests", "1");
-                  client.Timeout = TimeSpan.FromSeconds(10);
+          class GigafileLinkFinder:
+              def __init__(self, max_duration_minutes, num_workers):
+                  self.base_url = "https://xgf.nu/"
+                  self.num_workers = num_workers
+                  self.max_duration = timedelta(minutes=max_duration_minutes)
+                  self.found_links_file = "found_links.txt"
+                  self.stats_file = "stats.txt"
+                  self.status_file = "status.md"
+                  
+                  logging.basicConfig(
+                      level=logging.INFO,
+                      format='%(asctime)s - %(levelname)s - %(message)s'
+                  )
+                  self.logger = logging.getLogger(__name__)
+                  
+                  self.start_time = datetime.utcnow()
+                  self.total_requests = 0
+                  self.found_links = 0
+                  
+                  # GitHubで実行している場合の環境変数を取得
+                  self.github_workspace = os.getenv('GITHUB_WORKSPACE', '')
+                  self.github_repository = os.getenv('GITHUB_REPOSITORY', '')
+                  self.github_run_id = os.getenv('GITHUB_RUN_ID', '')
 
-                  var startTime = DateTime.UtcNow;
-                  LoadExistingCodes();
+              def generate_random_string(self, length):
+                  chars = string.ascii_letters + string.digits
+                  return ''.join(random.choice(chars) for _ in range(length))
+
+              def save_link(self, url, random_string):
+                  current_time = datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')
+                  with open(self.found_links_file, "a", encoding='utf-8') as f:
+                      f.write(f"{current_time} | {random_string} | {url}\n")
+                  self.found_links += 1
+                  self.update_status()
+
+              def update_stats(self):
+                  current_time = datetime.utcnow()
+                  runtime = (current_time - self.start_time).total_seconds()
                   
-                  var foundFiles = new List<string>();
-                  var processedCount = 0;
+                  with open(self.stats_file, "w", encoding='utf-8') as f:
+                      f.write(f"Statistics as of {current_time.strftime('%Y-%m-%d %H:%M:%S')} UTC\n")
+                      f.write("-" * 50 + "\n")
+                      f.write(f"Total requests made: {self.total_requests:,}\n")
+                      f.write(f"Found links: {self.found_links:,}\n")
+                      f.write(f"Success rate: {(self.found_links/self.total_requests*100 if self.total_requests else 0):.4f}%\n")
+                      f.write(f"Running time: {runtime:.2f} seconds\n")
+                      f.write(f"Requests per second: {self.total_requests/runtime:.2f}\n")
+                      f.write(f"Workers: {self.num_workers}\n")
+
+              def update_status(self):
+                  current_time = datetime.utcnow()
+                  runtime = (current_time - self.start_time).total_seconds()
                   
-                  Console.WriteLine($"Starting exploration at {startTime:yyyy-MM-dd HH:mm:ss UTC}");
-                  
-                  while (processedCount < MAX_ATTEMPTS && DateTime.UtcNow - startTime < MAX_RUNTIME)
-                  {
-                      var batchTasks = new List<Task>();
-                      var batchSize = Math.Min(BATCH_SIZE, MAX_ATTEMPTS - processedCount);
+                  with open(self.status_file, "w", encoding='utf-8') as f:
+                      f.write("# GigaFile Link Finder Status\n\n")
+                      f.write(f"## Current Run Information\n")
+                      f.write(f"- **Run ID**: {self.github_run_id}\n")
+                      f.write(f"- **Repository**: {self.github_repository}\n")
+                      f.write(f"- **Start Time**: {self.start_time.strftime('%Y-%m-%d %H:%M:%S')} UTC\n")
+                      f.write(f"- **Current Time**: {current_time.strftime('%Y-%m-%d %H:%M:%S')} UTC\n")
+                      f.write(f"- **Running Time**: {timedelta(seconds=int(runtime))}\n")
+                      f.write(f"- **Workers**: {self.num_workers}\n\n")
                       
-                      for (int i = 0; i < batchSize; i++)
-                      {
-                          var code = GenerateUniqueCode();
-                          if (code != null)
-                          {
-                              batchTasks.Add(ProcessCode(code, foundFiles));
-                              processedCount++;
-                          }
-                      }
+                      f.write("## Statistics\n")
+                      f.write(f"- **Total Requests**: {self.total_requests:,}\n")
+                      f.write(f"- **Found Links**: {self.found_links:,}\n")
+                      f.write(f"- **Success Rate**: {(self.found_links/self.total_requests*100 if self.total_requests else 0):.4f}%\n")
+                      f.write(f"- **Requests/Second**: {self.total_requests/runtime:.2f}\n\n")
                       
-                      await Task.WhenAll(batchTasks);
-                      await Task.Delay(500); // 待機時間短縮
-                  }
-
-                  var endTime = DateTime.UtcNow;
-                  Console.WriteLine($"Exploration completed at {endTime:yyyy-MM-dd HH:mm:ss UTC}");
-                  Console.WriteLine($"Total runtime: {(endTime - startTime).TotalSeconds:F1} seconds");
-                  Console.WriteLine($"Total requests: {processedCount}");
-                  
-                  await SaveResults(foundFiles);
-                  await UpdateSummary(foundFiles, startTime, endTime, processedCount);
-              }
-
-              static void LoadExistingCodes()
-              {
-                  if (File.Exists(resultFile))
-                  {
-                      foreach (var line in File.ReadLines(resultFile))
-                      {
-                          var parts = line.Split('|');
-                          if (parts.Length > 0)
-                          {
-                              var code = parts[0].Trim();
-                              existingCodes.Add(code);
-                          }
-                      }
-                      Console.WriteLine($"Loaded {existingCodes.Count} existing codes");
-                  }
-              }
-
-              static string GenerateUniqueCode()
-              {
-                  for (int i = 0; i < 20; i++) // 試行回数増加
-                  {
-                      var code = new string(Enumerable.Range(0, 4)
-                          .Select(_ => chars[random.Next(chars.Length)])
-                          .ToArray());
-                      
-                      if (!existingCodes.Contains(code))
-                      {
-                          existingCodes.Add(code);
-                          return code;
-                      }
-                  }
-                  return null;
-              }
-
-              static async Task ProcessCode(string code, List<string> foundFiles)
-              {
-                  try
-                  {
-                      var result = await CheckUrl(code);
-                      if (result.exists)
-                      {
-                          var fileInfo = $"{code} | {result.filename} | {result.size:N0} bytes | {DateTime.UtcNow:yyyy-MM-dd HH:mm:ss} | {baseUrl}{code}";
-                          lock (foundFiles)
-                          {
-                              foundFiles.Add(fileInfo);
-                              Console.WriteLine($"[FOUND] {fileInfo}");
-                          }
-                      }
-                  }
-                  catch (Exception ex)
-                  {
-                      if (ex is HttpRequestException || ex is TaskCanceledException)
-                      {
-                          Console.WriteLine($"Network error checking {code}");
-                      }
-                      else
-                      {
-                          Console.WriteLine($"Error checking {code}: {ex.Message}");
-                      }
-                  }
-              }
-
-              static async Task<(bool exists, string filename, long size)> CheckUrl(string code)
-              {
-                  using var request = new HttpRequestMessage(HttpMethod.Get, baseUrl + code);
-                  request.Headers.Add("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36");
-                  
-                  using var response = await client.SendAsync(request);
-                  
-                  if (response.RequestMessage.RequestUri.Host == "gigafile.nu")
-                  {
-                      var responseUri = response.RequestMessage.RequestUri.ToString();
-                      if (responseUri.Contains("/download.php") || responseUri.Contains("/dl_zip.php"))
-                      {
-                          using var fileResponse = await client.SendAsync(new HttpRequestMessage(HttpMethod.Head, responseUri));
-                          var contentDisposition = fileResponse.Headers.Contains("Content-Disposition") 
-                              ? fileResponse.Headers.GetValues("Content-Disposition").FirstOrDefault() 
-                              : null;
+                      if self.found_links > 0:
+                          f.write("## Recent Findings\n")
+                          f.write("| Time (UTC) | Code | URL |\n")
+                          f.write("|------------|------|-----|\n")
                           
-                          if (!string.IsNullOrEmpty(contentDisposition))
-                          {
-                              var match = Regex.Match(contentDisposition, @"filename[^;=\n]*=((['""]).*?\2|[^;\n]*)");
-                              var filename = match.Success ? match.Groups[1].Value.Trim('"') : "unknown";
-                              var size = fileResponse.Content.Headers.ContentLength ?? 0;
-                              
-                              // .txtファイル以外も記録するように変更
-                              return (true, filename, size);
-                          }
-                      }
-                  }
-                  
-                  return (false, string.Empty, 0);
-              }
+                          if os.path.exists(self.found_links_file):
+                              with open(self.found_links_file, 'r', encoding='utf-8') as links:
+                                  recent_links = list(links)[-10:]  # 最新10件
+                                  for link in recent_links:
+                                      time, code, url = link.strip().split(" | ")
+                                      f.write(f"| {time} | {code} | {url} |\n")
 
-              static async Task SaveResults(List<string> foundFiles)
-              {
-                  if (foundFiles.Count > 0)
-                  {
-                      var newContent = new List<string>();
-                      
-                      if (File.Exists(resultFile))
-                      {
-                          newContent.AddRange(File.ReadLines(resultFile));
-                      }
-                      
-                      newContent.AddRange(foundFiles);
-                      newContent = newContent.Distinct().OrderBy(x => x).ToList();
-                      
-                      await File.WriteAllLinesAsync(resultFile, newContent);
-                      Console.WriteLine($"Updated results file. Total entries: {newContent.Count}");
-                  }
-              }
+              def worker(self, worker_id):
+                  session = requests.Session()
+                  session.headers.update({
+                      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+                  })
 
-              static async Task UpdateSummary(List<string> newFiles, DateTime startTime, DateTime endTime, int totalRequests)
-              {
-                  var totalFiles = File.Exists(resultFile) ? File.ReadLines(resultFile).Count() : 0;
-                  var summaryContent = new List<string>
-                  {
-                      "# XGF Explorer Summary",
-                      "",
-                      $"Last Updated: {DateTime.UtcNow:yyyy-MM-dd HH:mm:ss UTC}",
-                      "",
-                      "## Statistics",
-                      $"- Total files found: {totalFiles}",
-                      $"- Files found in last run: {newFiles.Count}",
-                      $"- Last run duration: {(endTime - startTime).TotalSeconds:F1} seconds",
-                      $"- Requests made: {totalRequests}",
-                      $"- Success rate: {(newFiles.Count * 100.0 / totalRequests):F2}%",
-                      "",
-                      "## Recent Findings"
-                  };
+                  while (datetime.utcnow() - self.start_time) < self.max_duration:
+                      try:
+                          length = random.randint(4, 5)
+                          random_string = self.generate_random_string(length)
+                          url = self.base_url + random_string
+                          
+                          print(f"\r[Worker {worker_id}] [+] [ {random_string} ] mining... | Found: {self.found_links} | Requests: {self.total_requests}", end="")
+                          
+                          response = session.get(url, allow_redirects=True, timeout=10)
+                          self.total_requests += 1
+                          
+                          if self.total_requests % 100 == 0:
+                              self.update_stats()
+                              self.update_status()
 
-                  var recentFiles = newFiles
-                      .Union(File.Exists(resultFile) ? File.ReadLines(resultFile) : Enumerable.Empty<string>())
-                      .OrderByDescending(x => DateTime.Parse(x.Split('|')[3].Trim()))
-                      .Take(20);
+                          final_url = response.url
+                          
+                          if re.match(r'^https://\d+\.gigafile\.nu/[a-z0-9-]+$', final_url):
+                              print(f"\n[Worker {worker_id}] [*] [ {random_string} ] discover!! --> \033[33m{final_url}\033[0m")
+                              self.save_link(final_url, random_string)
+                          
+                          time.sleep(0.1)
+                          
+                      except requests.RequestException:
+                          continue
+                      except Exception as e:
+                          self.logger.error(f"Worker {worker_id} - Error: {str(e)}")
+                          continue
 
-                  summaryContent.Add("| Code | Filename | Size | Found At | Link |");
-                  summaryContent.Add("|------|----------|------|----------|------|");
-                  
-                  foreach (var file in recentFiles)
-                  {
-                      var parts = file.Split('|').Select(p => p.Trim()).ToArray();
-                      summaryContent.Add($"| {parts[0]} | {parts[1]} | {parts[2]} | {parts[3]} | {parts[4]} |");
-                  }
+              def run(self):
+                  print(f"""
+                  GigaFile Link Finder
+                  Simple GigaFile Link Collector [GitHub Actions Version]
+                  Run ID: {self.github_run_id}
+                  Repository: {self.github_repository}
+                  Start Time: {self.start_time.strftime('%Y-%m-%d %H:%M:%S')} UTC
+                  Duration: {self.max_duration.total_seconds()/60:.1f} minutes
+                  Workers: {self.num_workers}
+                  """)
 
-                  await File.WriteAllLinesAsync(summaryFile, summaryContent);
-              }
-          }
+                  with concurrent.futures.ThreadPoolExecutor(max_workers=self.num_workers) as executor:
+                      futures = [executor.submit(self.worker, i) for i in range(self.num_workers)]
+                      try:
+                          concurrent.futures.wait(futures)
+                      except KeyboardInterrupt:
+                          print("\nGracefully shutting down...")
+                      finally:
+                          self.update_stats()
+                          self.update_status()
+
+          if __name__ == "__main__":
+              duration_minutes = int(sys.argv[1]) if len(sys.argv) > 1 else 10
+              num_workers = int(sys.argv[2]) if len(sys.argv) > 2 else 25
+              
+              finder = GigafileLinkFinder(duration_minutes, num_workers)
+              finder.run()
           EOL
 
-      - name: Compile and Run Explorer
-        id: explore
+      - name: Run Link Finder
+        run: python gigafile_finder.py ${{ inputs.duration }} ${{ inputs.workers }}
+
+      - name: Create Results Directory
         run: |
-          dotnet new console
-          mv XgfExplorer.cs Program.cs
-          dotnet build
-          dotnet run
+          mkdir -p results
+          mv found_links.txt stats.txt status.md results/ || true
 
       - name: Commit and Push Results
-        if: success()
         run: |
           git config --global user.name 'github-actions[bot]'
           git config --global user.email 'github-actions[bot]@users.noreply.github.com'
           
-          if [ -d data ]; then
-            git add data/
-            git commit -m "Update exploration results: $(date -u +'%Y-%m-%d %H:%M:%S UTC')" || echo "No changes to commit"
+          if [ -d "results" ]; then
+            current_time=$(date -u +"%Y-%m-%d_%H-%M-%S")
+            git add results/
+            git commit -m "Update Link Finder results: ${current_time} UTC" || echo "No changes to commit"
             git push
           fi
-
-permissions:
-  contents: write
