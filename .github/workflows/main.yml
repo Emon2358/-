@@ -1,15 +1,20 @@
-name: Gigafile XGF Explorer
+name: Enhanced Gigafile XGF Explorer
 
 on:
   schedule:
-    - cron: '*/30 * * * *'  # Runs every 30 minutes
-  workflow_dispatch:  # Allows manual triggering
+    - cron: '*/10 * * * *'  # 10分ごとに実行
+  workflow_dispatch:  # 手動実行も可能
 
 jobs:
   explore:
     runs-on: ubuntu-latest
     
     steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
       - name: Setup .NET
         uses: actions/setup-dotnet@v3
         with:
@@ -23,6 +28,8 @@ jobs:
           using System.Threading.Tasks;
           using System.Text.RegularExpressions;
           using System.Collections.Generic;
+          using System.IO;
+          using System.Linq;
 
           class Program
           {
@@ -30,64 +37,117 @@ jobs:
               private static readonly string chars = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
               private static readonly Random random = new Random();
               private static readonly string baseUrl = "https://xgf.nu/";
+              private static readonly string resultFile = "found_files.txt";
+              private static readonly HashSet<string> existingCodes = new HashSet<string>();
+              private const int MAX_ATTEMPTS = 500; // 1回の実行で試行する最大数
+              private const int BATCH_SIZE = 10; // 並列処理のバッチサイズ
 
               static async Task Main()
               {
-                  var foundFiles = new List<string>();
-                  var attempts = 10; // Number of attempts per run
+                  // 既存のファイルから過去のコードを読み込む
+                  LoadExistingCodes();
                   
-                  for (int i = 0; i < attempts; i++)
+                  var foundFiles = new List<string>();
+                  var tasks = new List<Task>();
+                  var processedCount = 0;
+                  
+                  Console.WriteLine($"Starting exploration at {DateTime.UtcNow}");
+                  
+                  while (processedCount < MAX_ATTEMPTS)
                   {
-                      var code = GenerateCode();
-                      Console.WriteLine($"Checking code: {code}");
-                      
-                      try
+                      var batchTasks = new List<Task>();
+                      for (int i = 0; i < BATCH_SIZE && processedCount < MAX_ATTEMPTS; i++)
                       {
-                          var result = await CheckUrl(code);
-                          if (result.exists)
+                          var code = GenerateUniqueCode();
+                          if (code != null)
                           {
-                              Console.WriteLine($"[FOUND] Code: {code}, Filename: {result.filename}");
-                              foundFiles.Add($"{code}: {result.filename}");
+                              batchTasks.Add(ProcessCode(code, foundFiles));
+                              processedCount++;
                           }
-                          
-                          // Respect rate limit - 2 codes per second
-                          await Task.Delay(500);
                       }
-                      catch (Exception ex)
-                      {
-                          Console.WriteLine($"Error checking {code}: {ex.Message}");
-                          await Task.Delay(1000);
-                      }
+                      
+                      // バッチ実行して完了を待つ
+                      await Task.WhenAll(batchTasks);
+                      // レート制限を考慮して待機
+                      await Task.Delay(5000); // 5秒待機
                   }
 
-                  // Output results as GitHub step output
+                  // 結果の保存と出力
+                  await SaveResults(foundFiles);
+                  
+                  // GitHub Actionsの出力として設定
                   if (foundFiles.Count > 0)
                   {
                       var output = string.Join("\n", foundFiles);
                       Console.WriteLine($"::set-output name=found_files::{output}");
+                      Console.WriteLine($"::set-output name=found_count::{foundFiles.Count}");
                   }
               }
 
-              static string GenerateCode()
+              static void LoadExistingCodes()
               {
-                  var code = new char[4];
-                  for (int i = 0; i < 4; i++)
+                  if (File.Exists(resultFile))
                   {
-                      code[i] = chars[random.Next(chars.Length)];
+                      foreach (var line in File.ReadLines(resultFile))
+                      {
+                          var code = line.Split(':')[0].Trim();
+                          existingCodes.Add(code);
+                      }
+                      Console.WriteLine($"Loaded {existingCodes.Count} existing codes");
                   }
-                  return new string(code);
               }
 
-              static async Task<(bool exists, string filename)> CheckUrl(string code)
+              static string GenerateUniqueCode()
+              {
+                  int attempts = 0;
+                  while (attempts < 100) // 最大100回までユニークなコードを試みる
+                  {
+                      var code = new string(Enumerable.Range(0, 4)
+                          .Select(_ => chars[random.Next(chars.Length)])
+                          .ToArray());
+                      
+                      if (!existingCodes.Contains(code))
+                      {
+                          existingCodes.Add(code);
+                          return code;
+                      }
+                      attempts++;
+                  }
+                  return null;
+              }
+
+              static async Task ProcessCode(string code, List<string> foundFiles)
+              {
+                  try
+                  {
+                      var result = await CheckUrl(code);
+                      if (result.exists)
+                      {
+                          var fileInfo = $"{code}: {result.filename} | {result.size}bytes | {DateTime.UtcNow:yyyy-MM-dd HH:mm:ss}";
+                          lock (foundFiles)
+                          {
+                              foundFiles.Add(fileInfo);
+                              Console.WriteLine($"[FOUND] {fileInfo}");
+                          }
+                      }
+                  }
+                  catch (Exception ex)
+                  {
+                      Console.WriteLine($"Error checking {code}: {ex.Message}");
+                  }
+              }
+
+              static async Task<(bool exists, string filename, long size)> CheckUrl(string code)
               {
                   var url = baseUrl + code;
                   using var request = new HttpRequestMessage(HttpMethod.Head, url);
-                  request.Headers.Add("User-Agent", "GitHub-Actions-XGF-Explorer");
+                  request.Headers.Add("User-Agent", "GitHub-Actions-XGF-Explorer-Enhanced");
                   
                   var response = await client.SendAsync(request);
                   
                   if (response.RequestMessage.RequestUri.Host == "gigafile.nu")
                   {
+                      // ファイルが見つかった場合の処理
                       var fileResponse = await client.SendAsync(new HttpRequestMessage(HttpMethod.Head, response.RequestMessage.RequestUri));
                       var contentDisposition = fileResponse.Headers.Contains("Content-Disposition") 
                           ? fileResponse.Headers.GetValues("Content-Disposition").FirstOrDefault() 
@@ -97,45 +157,83 @@ jobs:
                       {
                           var match = Regex.Match(contentDisposition, @"filename[^;=\n]*=((['""]).*?\2|[^;\n]*)");
                           var filename = match.Success ? match.Groups[1].Value.Trim('"') : "unknown";
-                          return (true, filename);
+                          var size = fileResponse.Content.Headers.ContentLength ?? 0;
+                          
+                          // txtファイルのみを記録
+                          if (filename.EndsWith(".txt", StringComparison.OrdinalIgnoreCase))
+                          {
+                              return (true, filename, size);
+                          }
                       }
                   }
                   
-                  return (false, string.Empty);
+                  return (false, string.Empty, 0);
+              }
+
+              static async Task SaveResults(List<string> foundFiles)
+              {
+                  if (foundFiles.Count > 0)
+                  {
+                      var newContent = new List<string>();
+                      
+                      // 既存のファイル内容を読み込む
+                      if (File.Exists(resultFile))
+                      {
+                          newContent.AddRange(File.ReadLines(resultFile));
+                      }
+                      
+                      // 新しい結果を追加
+                      newContent.AddRange(foundFiles);
+                      
+                      // 重複を除去してソート
+                      newContent = newContent.Distinct().OrderBy(x => x).ToList();
+                      
+                      // ファイルに保存
+                      await File.WriteAllLinesAsync(resultFile, newContent);
+                      Console.WriteLine($"Updated results file with {foundFiles.Count} new entries. Total: {newContent.Count}");
+                  }
               }
           }
           EOL
 
       - name: Compile and Run Explorer
+        id: explore
         run: |
           dotnet new console
           mv XgfExplorer.cs Program.cs
           dotnet build
           dotnet run
 
-      - name: Process Results
-        if: always()
+      - name: Commit and Push Results
+        if: success()
         run: |
-          if [ -n "${{ steps.explore.outputs.found_files }}" ]; then
-            echo "Found files:"
-            echo "${{ steps.explore.outputs.found_files }}"
-          else
-            echo "No files found in this run."
+          git config --global user.name 'github-actions[bot]'
+          git config --global user.email 'github-actions[bot]@users.noreply.github.com'
+          
+          if [ -f found_files.txt ]; then
+            git add found_files.txt
+            git commit -m "Update found files: $(date -u +'%Y-%m-%d %H:%M:%S UTC')" || echo "No changes to commit"
+            git push
           fi
 
-      - name: Create Issue for Found Files
-        if: steps.explore.outputs.found_files
+      - name: Create Summary Issue
+        if: steps.explore.outputs.found_count > 0
         uses: actions/github-script@v6
         with:
           script: |
+            const foundCount = process.env.FOUND_COUNT;
             const foundFiles = process.env.FOUND_FILES;
-            if (foundFiles) {
-              await github.rest.issues.create({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                title: `[XGF Explorer] Files Found - ${new Date().toISOString()}`,
-                body: `Found the following files:\n\n${foundFiles}\n\n*This is an automated report from the XGF Explorer GitHub Action.*`
-              });
-            }
+            
+            await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: `[XGF Explorer] New TXT Files Found - ${new Date().toISOString()}`,
+              body: `Found ${foundCount} new TXT files in this run.\n\nNew findings:\n\`\`\`\n${foundFiles}\n\`\`\`\n\nComplete list can be found in found_files.txt`
+            });
         env:
+          FOUND_COUNT: ${{ steps.explore.outputs.found_count }}
           FOUND_FILES: ${{ steps.explore.outputs.found_files }}
+
+permissions:
+  contents: write
+  issues: write
